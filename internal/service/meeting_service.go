@@ -8,6 +8,7 @@ import (
 
 	"schedule-system/internal/dao"
 	"schedule-system/internal/model"
+	cachepkg "schedule-system/pkg/cache"
 
 	"gorm.io/gorm"
 )
@@ -22,6 +23,7 @@ var ErrMeetingTimeConflict = errors.New("meeting time conflict")
 
 type MeetingService struct {
 	meetingDAO dao.MeetingDAO
+	cacheStore *cachepkg.Store
 }
 
 type CreateMeetingInput struct {
@@ -59,8 +61,11 @@ type MeetingInvitationStateResult struct {
 	Status    string `json:"status"`
 }
 
-func NewMeetingService(meetingDAO dao.MeetingDAO) *MeetingService {
-	return &MeetingService{meetingDAO: meetingDAO}
+func NewMeetingService(meetingDAO dao.MeetingDAO, cacheStore *cachepkg.Store) *MeetingService {
+	return &MeetingService{
+		meetingDAO: meetingDAO,
+		cacheStore: cacheStore,
+	}
 }
 
 func (s *MeetingService) CreateMeeting(ctx context.Context, input CreateMeetingInput) (*CreateMeetingResult, error) {
@@ -81,6 +86,13 @@ func (s *MeetingService) CreateMeeting(ctx context.Context, input CreateMeetingI
 		return nil, err
 	}
 	if conflict {
+		return nil, ErrMeetingTimeConflict
+	}
+	conflictWithAcceptedMeetings, err := s.meetingDAO.HasAcceptedMeetingConflict(ctx, input.OrganizerID, input.StartTime, input.EndTime, 0)
+	if err != nil {
+		return nil, err
+	}
+	if conflictWithAcceptedMeetings {
 		return nil, ErrMeetingTimeConflict
 	}
 
@@ -113,6 +125,7 @@ func (s *MeetingService) CreateMeeting(ctx context.Context, input CreateMeetingI
 	if err := s.meetingDAO.CreateMeetingWithAttendees(ctx, event, attendees); err != nil {
 		return nil, err
 	}
+	s.invalidateOrganizerCaches(ctx, input.OrganizerID, event.ID)
 
 	resultAttendees := make([]MeetingAttendeeResult, 0, len(attendees))
 	for _, attendee := range attendees {
@@ -261,4 +274,14 @@ func isMeetingVisibilityValid(visibility string) bool {
 	default:
 		return false
 	}
+}
+
+func (s *MeetingService) invalidateOrganizerCaches(ctx context.Context, organizerID, meetingID uint) {
+	if s.cacheStore == nil {
+		return
+	}
+
+	_ = s.cacheStore.DeleteByPattern(ctx, cachepkg.EventListPattern(organizerID))
+	_ = s.cacheStore.DeleteByPattern(ctx, cachepkg.CalendarOwnerPattern(organizerID))
+	_ = s.cacheStore.Delete(ctx, cachepkg.EventItemKey(organizerID, meetingID))
 }

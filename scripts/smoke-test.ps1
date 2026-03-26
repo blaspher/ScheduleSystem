@@ -63,6 +63,46 @@ function Invoke-JsonRequest {
     return Invoke-RestMethod -Method $Method -Uri $Url -Headers $headers -TimeoutSec 20
 }
 
+function Get-StatusCodeFromError {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    if ($null -eq $ErrorRecord -or $null -eq $ErrorRecord.Exception) {
+        return $null
+    }
+    if ($null -eq $ErrorRecord.Exception.Response) {
+        return $null
+    }
+
+    $statusCode = $ErrorRecord.Exception.Response.StatusCode
+    if ($null -eq $statusCode) {
+        return $null
+    }
+
+    try { return [int]$statusCode.value__ } catch {}
+    try { return [int]$statusCode } catch {}
+    return $null
+}
+
+function Assert-ExpectedHttpStatus {
+    param(
+        [Parameter(Mandatory=$true)][scriptblock]$Action,
+        [Parameter(Mandatory=$true)][int]$ExpectedCode
+    )
+
+    try {
+        & $Action | Out-Null
+    }
+    catch {
+        $actualCode = Get-StatusCodeFromError -ErrorRecord $_
+        if ($actualCode -eq $ExpectedCode) {
+            return $actualCode
+        }
+        throw "expected HTTP $ExpectedCode, got $actualCode, detail=$($_.Exception.Message)"
+    }
+
+    throw "expected HTTP $ExpectedCode, but request succeeded"
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 Import-DotEnv -Path (Join-Path $repoRoot $EnvFile)
@@ -94,11 +134,17 @@ $tokenB = ""
 $userAID = 0
 $userBID = 0
 $eventID = 0
+$crossEventID = 0
 $meetingID = 0
 
 try {
     $null = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/healthz"
     Add-Step -Name "health check" -Passed $true -Detail "service reachable"
+
+    $blankStatus = Assert-ExpectedHttpStatus -ExpectedCode 400 -Action {
+        Invoke-JsonRequest -Method "POST" -Url "$BaseUrl/api/v1/auth/register" -Body @{ username = "   "; password = $pwd }
+    }
+    Add-Step -Name "register blank username" -Passed $true -Detail "status=$blankStatus"
 
     $regA = Invoke-JsonRequest -Method "POST" -Url "$BaseUrl/api/v1/auth/register" -Body @{ username = $userA; password = $pwd }
     $tokenA = $regA.data.access_token
@@ -136,6 +182,28 @@ try {
     $eventCount = @($eventsResp.data).Count
     Add-Step -Name "list events" -Passed $true -Detail "count=$eventCount"
 
+    $crossStart = (Get-Date).Date.AddDays(1).AddHours(23).AddMinutes(30)
+    $crossEnd = $crossStart.AddHours(2)
+    $crossResp = Invoke-JsonRequest -Method "POST" -Url "$BaseUrl/api/v1/events" -Token $tokenA -Body @{
+        title = "Cross Day Event"
+        description = "cross-day verification"
+        event_type = "personal"
+        visibility = "public"
+        start_time = $crossStart.ToString("o")
+        end_time = $crossEnd.ToString("o")
+        location = "desk"
+    }
+    $crossEventID = [int]$crossResp.data.id
+    Add-Step -Name "create cross-day event" -Passed $true -Detail "event_id=$crossEventID"
+
+    $crossDayDate = $crossEnd.ToString("yyyy-MM-dd")
+    $crossDayListResp = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/api/v1/events?view=day&date=$crossDayDate" -Token $tokenA
+    $crossDayIDs = @($crossDayListResp.data | ForEach-Object { [int]$_.id })
+    if ($crossDayIDs -notcontains $crossEventID) {
+        throw "cross-day event missing in next-day view (event_id=$crossEventID, date=$crossDayDate)"
+    }
+    Add-Step -Name "cross-day event visible on next day" -Passed $true -Detail "date=$crossDayDate"
+
     # Relation direction is explicit and aligned with permission model:
     # userB is viewer, userA is calendar owner -> set relation userB -> userA.
     $relResp = Invoke-JsonRequest -Method "POST" -Url "$BaseUrl/api/v1/relations" -Token $tokenB -Body @{
@@ -144,17 +212,20 @@ try {
     }
     Add-Step -Name "set relation userB->userA" -Passed $true -Detail "can_view_calendar=$($relResp.data.can_view_calendar)"
 
-    $calendarDate = $startEvent.ToString("yyyy-MM-dd")
-    $calendarResp = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/api/v1/users/$userAID/calendar?view=day&date=$calendarDate" -Token $tokenB
-    $calendarCount = @($calendarResp.data.events).Count
-    Add-Step -Name "get shared calendar" -Passed $true -Detail "events=$calendarCount"
-
     $meetingStart = (Get-Date).AddHours(3)
     $meetingEnd = $meetingStart.AddHours(1)
+    $meetingDate = $meetingStart.ToString("yyyy-MM-dd")
+
+    $eventsBeforeResp = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/api/v1/events" -Token $tokenA
+    $eventsBeforeCount = @($eventsBeforeResp.data).Count
+
+    $calendarBeforeResp = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/api/v1/users/$userAID/calendar?view=day&date=$meetingDate" -Token $tokenB
+    $calendarBeforeCount = @($calendarBeforeResp.data.events).Count
+
     $meetingResp = Invoke-JsonRequest -Method "POST" -Url "$BaseUrl/api/v1/meetings" -Token $tokenA -Body @{
         title = "Smoke Meeting"
         description = "meeting smoke"
-        visibility = "private"
+        visibility = "public"
         start_time = $meetingStart.ToString("o")
         end_time = $meetingEnd.ToString("o")
         location = "online"
@@ -163,12 +234,39 @@ try {
     $meetingID = [int]$meetingResp.data.meeting_id
     Add-Step -Name "create meeting" -Passed $true -Detail "meeting_id=$meetingID"
 
+    $eventsAfterResp = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/api/v1/events" -Token $tokenA
+    $eventsAfterCount = @($eventsAfterResp.data).Count
+    if ($eventsAfterCount -ne ($eventsBeforeCount + 1)) {
+        throw "event list cache invalidation failed (before=$eventsBeforeCount, after=$eventsAfterCount)"
+    }
+    Add-Step -Name "event list cache invalidation" -Passed $true -Detail "before=$eventsBeforeCount after=$eventsAfterCount"
+
+    $calendarAfterResp = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/api/v1/users/$userAID/calendar?view=day&date=$meetingDate" -Token $tokenB
+    $calendarAfterCount = @($calendarAfterResp.data.events).Count
+    if ($calendarAfterCount -ne ($calendarBeforeCount + 1)) {
+        throw "shared calendar cache invalidation failed (before=$calendarBeforeCount, after=$calendarAfterCount)"
+    }
+    Add-Step -Name "shared calendar cache invalidation" -Passed $true -Detail "before=$calendarBeforeCount after=$calendarAfterCount"
+
     $invitesResp = Invoke-JsonRequest -Method "GET" -Url "$BaseUrl/api/v1/meetings/invitations" -Token $tokenB
     $inviteCount = @($invitesResp.data).Count
     Add-Step -Name "list invitations" -Passed $true -Detail "count=$inviteCount"
 
     $acceptResp = Invoke-JsonRequest -Method "POST" -Url "$BaseUrl/api/v1/meetings/$meetingID/accept" -Token $tokenB
     Add-Step -Name "accept invitation" -Passed $true -Detail "status=$($acceptResp.data.status)"
+
+    $conflictStatus = Assert-ExpectedHttpStatus -ExpectedCode 409 -Action {
+        Invoke-JsonRequest -Method "POST" -Url "$BaseUrl/api/v1/meetings" -Token $tokenB -Body @{
+            title = "Conflict Meeting"
+            description = "expect conflict after accepted invitation"
+            visibility = "public"
+            start_time = $meetingStart.ToString("o")
+            end_time = $meetingEnd.ToString("o")
+            location = "online"
+            attendee_ids = @($userAID)
+        }
+    }
+    Add-Step -Name "create meeting conflict symmetry" -Passed $true -Detail "status=$conflictStatus"
 }
 catch {
     Add-Step -Name "smoke flow" -Passed $false -Detail $_.Exception.Message
@@ -177,13 +275,20 @@ catch {
 if ($Cleanup) {
     Write-Host "[INFO] Cleanup mode: best-effort cleanup started"
     try {
-        if ($tokenA -ne "" -and $eventID -gt 0) {
-            $null = Invoke-JsonRequest -Method "DELETE" -Url "$BaseUrl/api/v1/events/$eventID" -Token $tokenA
-            Add-Step -Name "cleanup delete event" -Passed $true -Detail "event_id=$eventID"
+        if ($tokenA -ne "") {
+            $deleteIDs = @()
+            if ($meetingID -gt 0) { $deleteIDs += $meetingID }
+            if ($crossEventID -gt 0) { $deleteIDs += $crossEventID }
+            if ($eventID -gt 0) { $deleteIDs += $eventID }
+
+            foreach ($id in $deleteIDs) {
+                $null = Invoke-JsonRequest -Method "DELETE" -Url "$BaseUrl/api/v1/events/$id" -Token $tokenA
+            }
+            Add-Step -Name "cleanup delete events" -Passed $true -Detail "count=$($deleteIDs.Count)"
         }
     }
     catch {
-        Add-Step -Name "cleanup delete event" -Passed $false -Detail $_.Exception.Message
+        Add-Step -Name "cleanup delete events" -Passed $false -Detail $_.Exception.Message
     }
 
     try {

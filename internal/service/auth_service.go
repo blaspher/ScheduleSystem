@@ -16,6 +16,7 @@ import (
 
 var ErrInvalidCredentials = errors.New("invalid username or password")
 var ErrUsernameAlreadyExists = errors.New("username already exists")
+var ErrInvalidUsername = errors.New("username must not be empty")
 var ErrUserNotFound = errors.New("user not found")
 
 type AuthService struct {
@@ -52,6 +53,10 @@ func NewAuthService(userDAO dao.UserDAO, jwtMgr *jwtpkg.Manager) *AuthService {
 
 func (s *AuthService) Register(ctx context.Context, input RegisterInput) (*AuthResult, error) {
 	username := strings.TrimSpace(input.Username)
+	if username == "" {
+		return nil, ErrInvalidUsername
+	}
+
 	user, err := s.userDAO.GetByUsername(ctx, username)
 	if err == nil && user != nil {
 		return nil, ErrUsernameAlreadyExists

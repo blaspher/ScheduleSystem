@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"strings"
 
 	"schedule-system/config"
 	"schedule-system/internal/api"
@@ -16,6 +17,9 @@ import (
 func main() {
 	log.Println("loading configuration")
 	cfg := config.Load()
+	if strings.TrimSpace(cfg.JWTSecret) == "" || cfg.JWTSecret == "change-me" {
+		log.Fatalf("invalid JWT_SECRET: must be set and must not use default value")
+	}
 
 	log.Println("initializing mysql and bootstrapping database")
 	db, err := database.NewMySQL(cfg.MySQLDSN)
@@ -48,7 +52,7 @@ func main() {
 	userRelationDAO := dao.NewUserRelationDAO(db)
 	authService := service.NewAuthService(userDAO, jwtMgr)
 	eventService := service.NewEventService(eventDAO, cacheStore)
-	meetingService := service.NewMeetingService(meetingDAO)
+	meetingService := service.NewMeetingService(meetingDAO, cacheStore)
 	relationService := service.NewRelationService(userRelationDAO, cacheStore)
 	calendarService := service.NewCalendarService(userRelationDAO, eventDAO, cacheStore)
 	authHandler := api.NewAuthHandler(authService)

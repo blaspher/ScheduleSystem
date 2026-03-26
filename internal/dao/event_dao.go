@@ -56,7 +56,7 @@ func (d *eventDAO) ListByOwnerID(ctx context.Context, ownerID uint, filter Event
 		query = query.Where("status <> ?", model.EventStatusCancelled)
 	}
 	if filter.StartTimeFrom != nil {
-		query = query.Where("start_time >= ?", *filter.StartTimeFrom)
+		query = query.Where("end_time > ?", *filter.StartTimeFrom)
 	}
 	if filter.StartTimeTo != nil {
 		query = query.Where("start_time < ?", *filter.StartTimeTo)

@@ -39,6 +39,10 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		Password: req.Password,
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrInvalidUsername) {
+			errorResponse(c, http.StatusBadRequest, err.Error())
+			return
+		}
 		if errors.Is(err, service.ErrUsernameAlreadyExists) {
 			errorResponse(c, http.StatusConflict, err.Error())
 			return
